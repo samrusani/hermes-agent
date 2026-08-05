@@ -3805,6 +3805,67 @@ class TestRunConversation:
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
+    def test_length_continuation_budget_resets_after_successful_tool_round(self, agent):
+        """A recovered tool round starts a fresh length-truncation episode."""
+        self._setup_agent(agent)
+
+        def tool_response(call_id):
+            return _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="web_search",
+                        arguments="{}",
+                        call_id=call_id,
+                    )
+                ],
+            )
+
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="part-1|", finish_reason="length"),
+            _mock_response(content="part-2|", finish_reason="length"),
+            tool_response("call-1"),
+            _mock_response(content="part-3|", finish_reason="length"),
+            tool_response("call-2"),
+            _mock_response(content="part-4|", finish_reason="length"),
+            tool_response("call-3"),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_tool,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("research this")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 8
+        assert result["final_response"] == "part-1|part-2|part-3|part-4|done"
+        assert mock_tool.call_count == 3
+
+    def test_four_consecutive_length_responses_still_exhaust_budget(self, agent):
+        """Tool-round resets must not weaken the consecutive retry bound."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=f"part-{index}|", finish_reason="length")
+            for index in range(1, 5)
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("generate a long response")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 4
+        assert result["error"] == "Response remained truncated after 4 continuation attempts"
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
